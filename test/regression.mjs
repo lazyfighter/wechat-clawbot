@@ -3341,7 +3341,7 @@ function check(name, ok, detail) {
       const iifeBody = src.slice(iifeStart + "void (async () => {".length, iifeEnd);
       const harness = new Function("deps", `
         let { ctx, config, sendText, codexPeer, pending, backlog, calendarHelper, alarms, uploadFileTo, fs,
-              pickAccount, WechatBridge, InboundRouter, runMonitor, logger, carryOverLegacyReminders } = deps;
+              pickAccount, WechatBridge, InboundRouter, WorkspaceSessions, runMonitor, logger, carryOverLegacyReminders } = deps;
         let bridge = null, router = null, monitorTask = null, currentAccount = null, warmSession, abort = new AbortController();
         ${monitorCode}
         const restart = (hot) => {
@@ -3368,7 +3368,7 @@ function check(name, ok, detail) {
           ctx: { inject() {} }, config, sendText: async () => {}, codexPeer: { close() {} },
           pending: { abortAll() {}, close() {}, reopen() {} }, backlog: {}, calendarHelper: { prepare: async () => {} }, alarms: {},
           uploadFileTo: async () => ({}), fs: {}, pickAccount: () => ({ accountId: "acct", configured: true, userId: "owner" }),
-          WechatBridge: FakeBridge, InboundRouter: class { handle() {} }, runMonitor,
+          WechatBridge: FakeBridge, InboundRouter: class { handle() {} }, WorkspaceSessions: class {}, runMonitor,
           logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {},
         });
         hh.startMonitor();
@@ -3399,7 +3399,7 @@ function check(name, ok, detail) {
           ctx: { inject() {} }, config: { macCalendar: true }, sendText: async () => {}, codexPeer: { close() {} },
           pending: { abortAll() {}, close() { closed(); }, reopen() {} }, backlog: {}, calendarHelper: { prepare: async () => {} }, alarms: {},
           uploadFileTo: async () => ({}), fs: {}, pickAccount: () => ({ accountId: "acct", configured: true, userId: "owner" }),
-          WechatBridge: WaitingBridge, InboundRouter: class { handle() {} },
+          WechatBridge: WaitingBridge, InboundRouter: class { handle() {} }, WorkspaceSessions: class {},
           runMonitor: ({ signal }) => (async () => { while (!signal.aborted) await sleep(5); })(),
           logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {},
         });

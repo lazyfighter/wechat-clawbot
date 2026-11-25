@@ -16,6 +16,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import { normalizeConfig, snapshotConfig, HOT_FIELDS, type ClawbotConfig } from "./config.js";
 import { WechatBridge } from "./bridge.js";
 import { InboundRouter } from "./inbound.js";
+import { WorkspaceSessions } from "./workspace-sessions.js";
 import { ApprovalRelay } from "./approvals.js";
 import { tryRegisterQuestionProvider } from "./questions.js";
 import { runMonitor } from "./monitor.js";
@@ -418,6 +419,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       bridge,
       pending,
       sendText,
+      workspaces: new WorkspaceSessions(ctx, sendText),
     });
 
     abort = new AbortController();

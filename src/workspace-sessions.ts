@@ -1,0 +1,461 @@
+/**
+ * WeChat → workspace sessions: an inbound message that starts with
+ * `@助理-<workspace>` is routed into a DSH session whose cwd is that workspace
+ * instead of the shared WeChat conversation. Every workspace has ONE default
+ * WeChat-assistant session, titled `微信助理`: adopted when the workspace
+ * already has one, created on first use otherwise, and remembered in a small
+ * state file so a DSH restart keeps the same address.
+ *
+ * Phase 1 is narrow on purpose: text in, the turn's last text out, no
+ * per-workspace permissions UI, no progress streaming. A message that arrives
+ * while a turn started in the WEB UI is running is queued, never steered:
+ * steering that turn would rewrite an answer the owner is watching in the GUI.
+ */
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+
+import type { Context } from "@deepseek-ai/cordis";
+import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
+import { SessionId } from "@deepseek-ai/dsh-session";
+import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
+
+import { eventText, listDshSessions, sendToDshSession } from "./dsh-sessions.js";
+import { resolveStateDir } from "./ilink/storage/state-dir.js";
+import { logger } from "./ilink/util/logger.js";
+
+/** Everything this feature listens for starts with this. */
+export const ROUTE_PREFIX = "@助理-";
+/** A message that is exactly this answers with the workspace list. */
+export const LIST_COMMAND = "工作区";
+/** Title of the one default WeChat-assistant session a workspace holds. */
+export const SESSION_TITLE = "微信助理";
+/**
+ * `source.kind` on every message injected here. A distinct value keeps this
+ * apart from the bridge's own WeChat turns and from the MCP route, so a reader
+ * can tell who started a turn.
+ */
+export const ROUTE_KIND = "plugin:wechat-clawbot:workspace";
+/** How much of one answer WeChat gets; the full text stays in the session. */
+const REPLY_CAP = 1_500;
+/** Report a turn still running after this long instead of waiting forever. */
+const TURN_TIMEOUT_MS = 15 * 60 * 1_000;
+
+/** The part of the host's workspace registry this feature reads. */
+type WorkspaceLike = {
+  readonly id: string;
+  readonly title: string;
+  readonly path: string;
+};
+
+type WorkspaceRegistryLike = {
+  list(): readonly WorkspaceLike[];
+};
+
+/** The part of the host's `sessionTitle` service used to pin a name. */
+type SessionTitleLike = {
+  rename(session: unknown, title: string): unknown;
+};
+
+/** The part of the host's `agentPresets` service used to mount tools. */
+type AgentPresetsLike = {
+  mount(ctx: unknown, id?: string): Promise<unknown>;
+};
+
+/** One workspace's address, persisted across restarts. */
+export type SessionRecord = {
+  sessionId: string;
+  /** Workspace directory when the session was made. */
+  path: string;
+  updatedAt: number;
+};
+
+export type RouteState = {
+  version: 1;
+  /** Workspace id → its session. Keyed by id, not title: titles are cosmetic. */
+  workspaces: Record<string, SessionRecord>;
+};
+
+/** A parsed `@助理-<name> <text>`. */
+export type ParsedRoute = { name: string; text: string };
+
+/** Read one service without importing the package that augments the Context. */
+function service<T>(ctx: Context, name: string): T | undefined {
+  const get = (ctx as unknown as { get?: (key: string) => unknown }).get;
+  if (typeof get !== "function") return undefined;
+  try {
+    return get.call(ctx, name) as T | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Where the workspace → session map lives (inside the plugin's state dir). */
+export function routesFile(): string {
+  return path.join(resolveStateDir(), "workspace-sessions.json");
+}
+
+export function loadRoutes(): RouteState {
+  try {
+    const raw = JSON.parse(fs.readFileSync(routesFile(), "utf-8")) as Partial<RouteState>;
+    if (raw.version === 1 && typeof raw.workspaces === "object" && raw.workspaces !== null) {
+      return { version: 1, workspaces: raw.workspaces };
+    }
+  } catch {
+    // Missing or unreadable: start empty; the next route rewrites it.
+  }
+  return { version: 1, workspaces: {} };
+}
+
+export function saveRoutes(state: RouteState): void {
+  const file = routesFile();
+  const tmp = `${file}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    logger.warn(`workspace: 保存 ${file} 失败: ${String(err)}`);
+  }
+}
+
+/** Names a message may use after the prefix: every title and directory name. */
+export function routeNames(entries: readonly WorkspaceLike[]): string[] {
+  const names = new Set<string>();
+  for (const entry of entries) {
+    const title = entry.title.trim();
+    if (title !== "") names.add(title);
+    const folder = path.basename(entry.path);
+    if (folder !== "") names.add(folder);
+  }
+  // Longest first: "wohome-old" must win over "wohome".
+  return [...names].sort((a, b) => b.length - a.length);
+}
+
+/**
+ * Split `@助理-<name><space?><text>`. The name is matched against the known
+ * names (longest first) so both `@助理-wohome 跑测试` and `@助理-wohome跑测试`
+ * address the same workspace; an unknown name falls back to the first token so
+ * the error can say what was not found.
+ */
+export function parseRoute(body: string, names: readonly string[]): ParsedRoute | undefined {
+  const text = body.trimStart();
+  if (!text.startsWith(ROUTE_PREFIX)) return undefined;
+  const rest = text.slice(ROUTE_PREFIX.length);
+  const lower = rest.toLowerCase();
+  for (const name of names) {
+    if (lower.startsWith(name.toLowerCase())) {
+      return { name, text: rest.slice(name.length).trim() };
+    }
+  }
+  const match = /^(\S*)\s*([\s\S]*)$/u.exec(rest);
+  if (match === null) return { name: rest.trim(), text: "" };
+  return { name: match[1] ?? "", text: (match[2] ?? "").trim() };
+}
+
+/** The workspace a name refers to: its title first, then its directory name. */
+export function matchWorkspace(
+  entries: readonly WorkspaceLike[],
+  name: string,
+): WorkspaceLike | undefined {
+  const target = name.trim().toLowerCase();
+  if (target === "") return undefined;
+  return entries.find((entry) => entry.title.trim().toLowerCase() === target)
+    ?? entries.find((entry) => path.basename(entry.path).toLowerCase() === target);
+}
+
+export class WorkspaceSessions {
+  /** Agents made here, held so their sessions stay live between turns. */
+  private readonly handles = new Map<string, AgentHandle>();
+  /** Sessions whose running turn this router drives (and watches). */
+  private readonly busy = new Set<string>();
+  /** Messages held for a session because a GUI-started turn was running. */
+  private readonly queue = new Map<string, Array<{ sender: string; label: string; text: string }>>();
+
+  constructor(
+    private readonly ctx: Context,
+    private readonly sendText: (to: string, text: string) => Promise<void>,
+  ) {}
+
+  /**
+   * Consume `body` when it addresses a workspace (or asks for the list).
+   * @returns whether the message belonged here; false means "not ours".
+   */
+  async tryHandle(sender: string, body: string, extra = ""): Promise<boolean> {
+    const trimmed = body.trim();
+    if (trimmed === LIST_COMMAND || trimmed === `/${LIST_COMMAND}`) {
+      await this.reply(sender, this.describe());
+      return true;
+    }
+    const entries = this.workspaces();
+    const parsed = parseRoute(body, routeNames(entries));
+    if (parsed === undefined) return false;
+    if (parsed.name === "") {
+      await this.reply(sender, this.describe());
+      return true;
+    }
+    const workspace = matchWorkspace(entries, parsed.name);
+    if (workspace === undefined) {
+      await this.reply(sender, `没找到「${parsed.name}」这个工作区。\n\n${this.describe()}`);
+      return true;
+    }
+    let record: SessionRecord;
+    try {
+      record = await this.ensureSession(workspace);
+    } catch (err) {
+      logger.error(`workspace: 给 ${workspace.title} 建会话失败: ${String(err)}`);
+      await this.reply(sender, `给「${workspace.title}」建会话失败：${String(err).slice(0, 200)}`);
+      return true;
+    }
+    const label = `助理-${workspace.title}`;
+    const text = [parsed.text, extra].filter((part) => part.trim() !== "").join("\n");
+    if (text.trim() === "") {
+      await this.reply(sender, `${label} 已就绪，直接说事。`);
+      return true;
+    }
+    await this.deliver(sender, label, record.sessionId, text);
+    return true;
+  }
+
+  private workspaces(): readonly WorkspaceLike[] {
+    const registry = service<WorkspaceRegistryLike>(this.ctx, "workspaceRegistry");
+    if (registry === undefined) return [];
+    try {
+      return registry.list();
+    } catch (err) {
+      logger.warn(`workspace: 读工作区列表失败: ${String(err)}`);
+      return [];
+    }
+  }
+
+  /** The 工作区 reply: what exists, and whether a session does too. */
+  private describe(): string {
+    const entries = this.workspaces();
+    if (entries.length === 0) return "这个 DSH 没有可用的工作区服务，或者工作区是空的。";
+    const state = loadRoutes();
+    const lines = entries.map((entry) => {
+      const made = state.workspaces[entry.id] === undefined ? "" : "（已建会话）";
+      return `· ${entry.title}${made}`;
+    });
+    return `工作区 ${entries.length} 个：\n${lines.join("\n")}\n\n发「@助理-工作区名 内容」交给它。`;
+  }
+
+  private async ensureSession(workspace: WorkspaceLike): Promise<SessionRecord> {
+    const state = loadRoutes();
+    const existing = state.workspaces[workspace.id];
+    if (existing !== undefined && existing.path === workspace.path && await this.sessionExists(existing.sessionId)) {
+      return existing;
+    }
+    if (existing !== undefined) {
+      logger.warn(`workspace: ${workspace.title} 原来的会话 ${existing.sessionId} 不可用了，重新找一个`);
+    }
+    // One default assistant per workspace: a 微信助理 the owner already made
+    // in this workspace is taken over instead of shadowed by a second one.
+    const adopted = await this.defaultSession(workspace);
+    const sessionId = adopted ?? `session-${randomUUID()}`;
+    if (adopted === undefined) {
+      await this.createSession(workspace, sessionId);
+    } else {
+      logger.info(`workspace: 接管 ${workspace.title} 已有的会话 ${adopted}`);
+    }
+    const record: SessionRecord = { sessionId, path: workspace.path, updatedAt: Date.now() };
+    saveRoutes({ version: 1, workspaces: { ...state.workspaces, [workspace.id]: record } });
+    return record;
+  }
+
+  /** The workspace's existing `微信助理` session, if it has one. */
+  private async defaultSession(workspace: WorkspaceLike): Promise<string | undefined> {
+    const { rows } = await listDshSessions(this.ctx);
+    const wanted = path.normalize(workspace.path);
+    const hit = rows.find((row) =>
+      row.title === SESSION_TITLE
+      && row.cwd !== undefined
+      && path.normalize(row.cwd) === wanted);
+    return hit?.id;
+  }
+
+  /**
+   * Whether a mapped session still exists, live or only on disk. A live agent
+   * is enough; otherwise ask `sessionQuery`. When the host cannot tell (no
+   * such service), keep the address rather than silently orphaning a session.
+   */
+  private async sessionExists(sessionId: string): Promise<boolean> {
+    if (this.ctx.agents.get(SessionId(sessionId)) !== undefined) return true;
+    const query = service<{ listSessions(): Promise<readonly { header: { id: unknown } }[]> }>(
+      this.ctx,
+      "sessionQuery",
+    );
+    if (query === undefined) return true;
+    try {
+      const rows = await query.listSessions();
+      return rows.some((row) => String(row.header.id) === sessionId);
+    } catch (err) {
+      logger.warn(`workspace: 读会话列表失败（保留原地址）: ${String(err)}`);
+      return true;
+    }
+  }
+
+  private async createSession(workspace: WorkspaceLike, sessionId: string): Promise<void> {
+    const defaultModel = this.ctx.get("agentDefaultModel");
+    const selection = defaultModel?.currentSelection();
+    const handle = await this.ctx.agents.create({
+      sessionId: SessionId(sessionId),
+      meta: { cwd: workspace.path },
+      agentOptions: selection === undefined
+        ? undefined
+        : { provider: selection.provider, model: selection.model },
+      setup: async (agentCtx: Context) => {
+        // Same tool layer the GUI session gets: without the preset mount the
+        // agent has a model and no tools.
+        const presets = service<AgentPresetsLike>(agentCtx, "agentPresets");
+        if (presets === undefined) {
+          logger.warn("workspace: 没有 agentPresets 服务，工作区会话将只有全局工具");
+          return;
+        }
+        try {
+          await presets.mount(agentCtx);
+        } catch (err) {
+          logger.warn(`workspace: 挂 preset 失败: ${String(err)}`);
+        }
+      },
+    });
+    this.handles.set(sessionId, handle);
+    // Nothing in WeChat can answer an approval prompt, and a session parked on
+    // one would hold the queued messages behind it. Same choice the owner made
+    // for the WeChat conversation itself.
+    try {
+      setApprovalPolicy(handle.agent.session, "never");
+    } catch (err) {
+      logger.warn(`workspace: 设置审批策略失败: ${String(err)}`);
+    }
+    const titles = service<SessionTitleLike>(this.ctx, "sessionTitle");
+    if (titles !== undefined) {
+      try {
+        titles.rename(handle.agent.session, SESSION_TITLE);
+      } catch (err) {
+        logger.warn(`workspace: 设置标题失败: ${String(err)}`);
+      }
+    }
+    logger.info(`workspace: 新建 ${sessionId} → ${SESSION_TITLE} (${workspace.path})`);
+  }
+
+  private async deliver(sender: string, label: string, sessionId: string, text: string): Promise<void> {
+    const agent = this.ctx.agents.get(SessionId(sessionId));
+    const ours = this.busy.has(sessionId);
+    if (!ours && agent !== undefined && agent.status === "running") {
+      // Started in the GUI: queue behind it, never steer into it.
+      const list = this.queue.get(sessionId) ?? [];
+      list.push({ sender, label, text });
+      this.queue.set(sessionId, list);
+      this.watchForeignTurn(sessionId);
+      await this.reply(sender, `${label} 正忙（那一轮不是微信发起的），这条排上了，忙完就发。`);
+      return;
+    }
+    if (!ours) this.busy.add(sessionId);
+    await this.reply(sender, `已交给 ${label}。`);
+    const sent = await sendToDshSession(this.ctx, sessionId, text, { kind: ROUTE_KIND, wake: true });
+    if (!sent.ok) {
+      if (!ours) this.busy.delete(sessionId);
+      await this.reply(sender, `没送进 ${label}：${sent.message}`);
+      return;
+    }
+    if (ours) return; // steered into the turn already being watched
+    if (sent.delivered !== "followup") {
+      // A turn nobody here started grabbed the message in the gap between the
+      // status check and the send: never speak for that turn.
+      this.busy.delete(sessionId);
+      await this.reply(sender, `${label} 正有一轮在跑，这条并进去了，结果到网页里看。`);
+      return;
+    }
+    void this.watch(sender, label, sessionId, sent.agent as unknown as Agent, sent.before);
+  }
+
+  /** Wait for the turn to end, then send its last text to WeChat. */
+  private async watch(sender: string, label: string, sessionId: string, agent: Agent, before: number): Promise<void> {
+    try {
+      let timedOut = false;
+      await Promise.race([
+        agent.whenIdle(),
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            timedOut = true;
+            resolve();
+          }, TURN_TIMEOUT_MS).unref?.();
+        }),
+      ]);
+      if (timedOut) {
+        await this.reply(sender, `${label} 跑了 15 分钟还没结束，先用网页看吧。`);
+        return;
+      }
+      const answer = this.lastText(agent, before);
+      await this.reply(sender, answer ?? `${label} 这一轮没有文字回复。`);
+    } catch (err) {
+      logger.error(`workspace: 等待 ${sessionId} 的回复失败: ${String(err)}`);
+    } finally {
+      this.busy.delete(sessionId);
+      void this.drain(sessionId);
+    }
+  }
+
+  /** The last assistant text written after `before`, capped for WeChat. */
+  private lastText(agent: Agent, before: number): string | undefined {
+    let text: string | undefined;
+    for (const event of agent.session.snapshotEvents()) {
+      if (event.seq <= before) continue;
+      if (event.type !== "assistant/message") continue;
+      const body = eventText(event as { type: string; data?: unknown });
+      if (body !== "") text = body;
+    }
+    if (text === undefined) return undefined;
+    return text.length > REPLY_CAP
+      ? `${text.slice(0, REPLY_CAP)}…\n（太长，完整回复在网页里）`
+      : text;
+  }
+
+  /**
+   * Drain a queue nobody here is watching: the running turn belongs to the
+   * GUI, so the only signal its end offers is the agent going idle.
+   */
+  private watchForeignTurn(sessionId: string): void {
+    const agent = this.ctx.agents.get(SessionId(sessionId));
+    if (agent === undefined) return;
+    void agent.whenIdle().then(() => this.drain(sessionId)).catch((err: unknown) => {
+      logger.warn(`workspace: 等待空闲失败: ${String(err)}`);
+    });
+  }
+
+  /** Send the next queued message once the session is free again. */
+  private async drain(sessionId: string): Promise<void> {
+    if (this.busy.has(sessionId)) return;
+    const list = this.queue.get(sessionId);
+    if (list === undefined || list.length === 0) {
+      this.queue.delete(sessionId);
+      return;
+    }
+    const item = list.shift();
+    if (item === undefined) return;
+    if (list.length === 0) this.queue.delete(sessionId);
+    this.busy.add(sessionId);
+    await this.reply(item.sender, `轮到 ${item.label} 了。`);
+    const sent = await sendToDshSession(this.ctx, sessionId, item.text, { kind: ROUTE_KIND, wake: true });
+    if (!sent.ok) {
+      this.busy.delete(sessionId);
+      await this.reply(item.sender, `没送进 ${item.label}：${sent.message}`);
+      return;
+    }
+    if (sent.delivered !== "followup") {
+      this.busy.delete(sessionId);
+      await this.reply(item.sender, `${item.label} 正有一轮在跑，这条并进去了，结果到网页里看。`);
+      return;
+    }
+    void this.watch(item.sender, item.label, sessionId, sent.agent as unknown as Agent, sent.before);
+  }
+
+  private async reply(sender: string, text: string): Promise<void> {
+    try {
+      await this.sendText(sender, text);
+    } catch (err) {
+      logger.warn(`workspace: 回微信失败: ${String(err)}`);
+    }
+  }
+}

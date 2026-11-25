@@ -15,6 +15,7 @@ import { lookupQuoteMessage, recordQuoteMessage } from "./quote-history.js";
 import type { ResolvedWeixinAccount } from "./ilink/auth/accounts.js";
 import type { ClawbotConfig } from "./config.js";
 import type { WechatBridge } from "./bridge.js";
+import type { WorkspaceSessions } from "./workspace-sessions.js";
 import { PendingRegistry } from "./pending.js";
 import { loadContextToken, saveContextToken } from "./state.js";
 import { logger } from "./ilink/util/logger.js";
@@ -123,6 +124,8 @@ export class InboundRouter {
   private readonly bridge: WechatBridge;
   private readonly pending: PendingRegistry;
   private readonly sendText: (to: string, text: string) => Promise<void>;
+  /** `@助理-<workspace>` routing; absent in compositions without one. */
+  private readonly workspaces: WorkspaceSessions | undefined;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -130,12 +133,14 @@ export class InboundRouter {
     bridge: WechatBridge;
     pending: PendingRegistry;
     sendText: (to: string, text: string) => Promise<void>;
+    workspaces?: WorkspaceSessions;
   }) {
     this.config = deps.config;
     this.account = deps.account;
     this.bridge = deps.bridge;
     this.pending = deps.pending;
     this.sendText = deps.sendText;
+    this.workspaces = deps.workspaces;
   }
 
   /** Whether a sender may talk to the agent. */
@@ -301,6 +306,15 @@ export class InboundRouter {
         imagePath: firstImagePath,
         time: Date.now(),
       });
+    }
+
+    // "@助理-<workspace> ..." belongs to that workspace's session, not to the
+    // shared WeChat conversation (see workspace-sessions.ts). The quote and
+    // media notes ride along, so a quoted line or a downloaded file still
+    // reaches the workspace.
+    if (this.workspaces !== undefined) {
+      const extra = [quotePrefix, mediaNote].filter(Boolean).join("\n");
+      if (await this.workspaces.tryHandle(sender, body, extra)) return;
     }
 
     // Route into the shared WeChat session (fire-and-forget: the reply is
