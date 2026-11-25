@@ -11,7 +11,7 @@ import { test } from "node:test";
 
 process.env.CLAWBOT_STATE_DIR = mkdtempSync(join(tmpdir(), "clawbot-ws-live-"));
 
-const { WorkspaceSessions, loadRoutes, routeLogFile, readRoutes } = await import("../lib/workspace-sessions.js");
+const { WorkspaceSessions, loadRoutes, routeLogFile, readRoutes, splitForWechat } = await import("../lib/workspace-sessions.js");
 
 const WOHOME = "/Users/x/wohome";
 
@@ -321,4 +321,30 @@ test("/路由 without any record says so", async () => {
   const router = new WorkspaceSessions(host.ctx, inbox.sendText);
   assert.equal(await router.tryHandle("owner", "路由"), true);
   assert.match(inbox.sent[0].text, /还没有路由记录/);
+});
+
+test("a long answer is split, never cut: every character reaches WeChat", async () => {
+  const host = stubHost();
+  const inbox = makeInbox();
+  const router = new WorkspaceSessions(host.ctx, inbox.sendText);
+
+  await router.tryHandle("owner", "@助理-wohome 说详细点");
+  const sessionId = host.created[0].sessionId;
+  const long = Array.from({ length: 60 }, (_, i) => `第 ${i + 1} 段：`.padEnd(40, "字")).join("\n\n");
+  await answer(host.turns, sessionId, long);
+
+  const tail = inbox.sent.slice(1).map((m) => m.text);
+  assert.ok(tail.length > 1, `expected a split, got ${tail.length} message(s)`);
+  assert.equal(tail.join("").replace(/\s+/g, ""), long.replace(/\s+/g, ""));
+  assert.ok(tail.every((text) => text.length <= 1500));
+  assert.ok(!tail.some((text) => /太长/.test(text)));
+});
+
+test("splitForWechat keeps short text whole and prefers paragraph breaks", () => {
+  assert.deepEqual(splitForWechat("短回答"), ["短回答"]);
+  const para = `${"a".repeat(1000)}\n\n${"b".repeat(1000)}`;
+  const chunks = splitForWechat(para);
+  assert.equal(chunks.length, 2);
+  assert.equal(chunks[0], "a".repeat(1000));
+  assert.equal(chunks[1], "b".repeat(1000));
 });

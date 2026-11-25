@@ -38,8 +38,14 @@ export const SESSION_TITLE = "微信助理";
  * can tell who started a turn.
  */
 export const ROUTE_KIND = "plugin:wechat-clawbot:workspace";
-/** How much of one answer WeChat gets; the full text stays in the session. */
-const REPLY_CAP = 1_500;
+/**
+ * How much text one WeChat message takes. A 1500-character answer is known to
+ * arrive intact, so longer answers are split at that size rather than cut —
+ * the owner has to read the whole thing to decide anything.
+ */
+export const CHUNK_CHARS = 1_500;
+/** Upper bound on split messages for one answer (a safety net, not a policy). */
+export const MAX_CHUNKS = 8;
 /** Report a turn still running after this long instead of waiting forever. */
 const TURN_TIMEOUT_MS = 15 * 60 * 1_000;
 
@@ -154,6 +160,28 @@ export function readRoutes(): Record<string, unknown>[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Cut one answer into WeChat-sized messages, preferring paragraph breaks.
+ * The caller sends every piece: nothing is dropped except a pathological tail
+ * beyond {@link MAX_CHUNKS}.
+ */
+export function splitForWechat(text: string): string[] {
+  const chunks: string[] = [];
+  let rest = text.trim();
+  while (rest.length > CHUNK_CHARS && chunks.length < MAX_CHUNKS - 1) {
+    const window = rest.slice(0, CHUNK_CHARS);
+    let cut = window.lastIndexOf("\n\n");
+    if (cut < CHUNK_CHARS / 2) cut = window.lastIndexOf("\n");
+    if (cut < CHUNK_CHARS / 2) cut = CHUNK_CHARS;
+    chunks.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest !== "") {
+    chunks.push(rest.length > CHUNK_CHARS ? `${rest.slice(0, CHUNK_CHARS)}…` : rest);
+  }
+  return chunks.filter((chunk) => chunk !== "");
 }
 
 /** What the bot's own conversation is told about one routed message. */
@@ -659,7 +687,7 @@ export class WorkspaceSessions {
     }
   }
 
-  /** The last assistant text written after `before`, capped for WeChat. */
+  /** The last assistant text written after `before`, whole (split when sent). */
   private lastText(agent: Agent, before: number): string | undefined {
     let text: string | undefined;
     for (const event of agent.session.snapshotEvents()) {
@@ -668,10 +696,7 @@ export class WorkspaceSessions {
       const body = eventText(event as { type: string; data?: unknown });
       if (body !== "") text = body;
     }
-    if (text === undefined) return undefined;
-    return text.length > REPLY_CAP
-      ? `${text.slice(0, REPLY_CAP)}…\n（太长，完整回复在网页里）`
-      : text;
+    return text;
   }
 
   /**
@@ -716,10 +741,13 @@ export class WorkspaceSessions {
   }
 
   private async reply(sender: string, text: string): Promise<void> {
-    try {
-      await this.sendText(sender, text);
-    } catch (err) {
-      logger.warn(`workspace: 回微信失败: ${String(err)}`);
+    for (const chunk of splitForWechat(text)) {
+      try {
+        await this.sendText(sender, chunk);
+      } catch (err) {
+        logger.warn(`workspace: 回微信失败: ${String(err)}`);
+        return;
+      }
     }
   }
 }
