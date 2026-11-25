@@ -43,8 +43,11 @@ function stubHost() {
       },
       snapshotEvents: () => state.events,
     };
+    const registeredTools = [];
     const agent = {
       session,
+      ctx: { tools: { register: (definition) => registeredTools.push(definition) } },
+      registeredTools,
       get status() {
         return state.running ? "running" : "idle";
       },
@@ -127,10 +130,13 @@ function stubHost() {
       async create({ sessionId, meta, agentOptions, setup }) {
         const record = { sessionId: String(sessionId), meta, agentOptions };
         created.push(record);
+        const made = makeAgent(String(sessionId), meta.cwd);
+        // The host hands setup the agent-scoped ctx: services plus the agent's
+        // own tool registry.
         await setup?.({
           get: (name) => (name === "agentPresets" ? { mount: async () => {} } : undefined),
+          tools: made.agent.ctx.tools,
         });
-        const made = makeAgent(String(sessionId), meta.cwd);
         agents.set(String(sessionId), made.agent);
         catalog.set(String(sessionId), { cwd: meta.cwd, title: undefined });
         turns.set(String(sessionId), made);
@@ -163,7 +169,11 @@ async function answer(turns, sessionId, text) {
 test("a routed message creates a session, pins the title, and answers", async () => {
   const host = stubHost();
   const inbox = makeInbox();
-  const router = new WorkspaceSessions(host.ctx, inbox.sendText);
+  const instrumentation = [];
+  const router = new WorkspaceSessions(host.ctx, inbox.sendText, (agentCtx) => {
+    instrumentation.push(agentCtx);
+    agentCtx.tools.register({ name: "ask_user_question" });
+  });
 
   const handled = await router.tryHandle("owner", "@助理-wohome 你好");
   assert.equal(handled, true);
@@ -174,6 +184,13 @@ test("a routed message creates a session, pins the title, and answers", async ()
   assert.equal(host.renamed[0].title, "微信助理");
 
   const sessionId = host.created[0].sessionId;
+  // A workspace agent driven from WeChat has to ask through WeChat: the
+  // global ask_user_question opens the web UI panel instead.
+  assert.equal(instrumentation.length, 1);
+  const agentCtx = instrumentation[0];
+  const sessionAgent = host.agents.get(sessionId);
+  assert.equal(agentCtx.tools, sessionAgent.ctx.tools);
+  assert.deepEqual(sessionAgent.registeredTools.map((t) => t.name), ["ask_user_question"]);
   // The GUI groups sessions per workspace by membership: an unattached session
   // is invisible in the workspace it was made for.
   assert.deepEqual(host.attached, [sessionId]);

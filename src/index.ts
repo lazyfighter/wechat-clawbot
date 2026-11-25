@@ -33,7 +33,7 @@ import { CodexPeer } from "./codex-peer.js";
 import { claimInstance } from "./instance-guard.js";
 import { CodexProgressStore } from "./codex-progress.js";
 import { Backlog } from "./backlog.js";
-import { uploadFileTo } from "./tool.js";
+import { registerWechatAskTool, uploadFileTo } from "./tool.js";
 import { ensureMemoryFile } from "./memory.js";
 import { addSecretaryRules, hasSecretaryRules, registerMemoryOpenRoute, removeSecretaryRules, upgradeSecretaryRules } from "./secretary.js";
 import { registerPermissionRoutes } from "./permissions.js";
@@ -419,7 +419,14 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       bridge,
       pending,
       sendText,
-      workspaces: new WorkspaceSessions(ctx, sendText),
+      workspaces: new WorkspaceSessions(ctx, sendText, (agentCtx) => {
+        // A workspace agent driven from WeChat must ask through WeChat too.
+        registerWechatAskTool(agentCtx, {
+          getBridge: () => bridge,
+          getAccount: () => account,
+          config,
+        });
+      }),
     });
 
     abort = new AbortController();

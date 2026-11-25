@@ -209,12 +209,20 @@ export class WorkspaceSessions {
   private readonly handles = new Map<string, AgentHandle>();
   /** Sessions whose running turn this router drives (and watches). */
   private readonly busy = new Set<string>();
+  /** Session ids whose agent already carries the WeChat question tool. */
+  private readonly tools = new Set<string>();
   /** Messages held for a session because a GUI-started turn was running. */
   private readonly queue = new Map<string, Array<{ sender: string; label: string; text: string }>>();
 
   constructor(
     private readonly ctx: Context,
     private readonly sendText: (to: string, text: string) => Promise<void>,
+    /**
+     * Registers the WeChat `ask_user_question` override on one agent. Without
+     * it a workspace agent asks through the web UI, where a WeChat user cannot
+     * answer — the turn sits there until it times out.
+     */
+    private readonly registerTools?: (agentCtx: Context) => void,
   ) {}
 
   /**
@@ -414,6 +422,10 @@ export class WorkspaceSessions {
         } catch (err) {
           logger.warn(`workspace: 挂 preset 失败: ${String(err)}`);
         }
+        // After the preset mount, like the WeChat agent: without this the
+        // agent asks through the web UI and the turn waits for an answer
+        // nobody can give from WeChat.
+        this.ensureTools(agentCtx, sessionId);
       },
     });
     this.handles.set(sessionId, handle);
@@ -434,6 +446,39 @@ export class WorkspaceSessions {
       }
     }
     logger.info(`workspace: 新建 ${sessionId} → ${SESSION_TITLE} (${workspace.path})`);
+  }
+
+  /** Give one agent the WeChat question tool, once per session. */
+  private ensureTools(agentCtx: Context, sessionId: string): void {
+    if (this.registerTools === undefined) return;
+    if (this.tools.has(sessionId)) return;
+    this.tools.add(sessionId);
+    try {
+      this.registerTools(agentCtx);
+    } catch (err) {
+      this.tools.delete(sessionId);
+      logger.warn(`workspace: 给会话 ${sessionId} 装提问工具失败: ${String(err)}`);
+    }
+  }
+
+  /**
+   * The live agent for a session, waking it when dormant — the tools have to
+   * be on the agent *before* the turn starts, not after it has already asked.
+   */
+  private async wake(sessionId: string): Promise<Agent | undefined> {
+    const live = this.ctx.agents.get(SessionId(sessionId)) as Agent | undefined;
+    if (live !== undefined) return live;
+    const controller = service<{
+      resolveAgent(id: unknown): Promise<{ agent?: Agent } | { error: unknown }>;
+    }>(this.ctx, "sessionController");
+    if (controller === undefined) return undefined;
+    try {
+      const resolved = await controller.resolveAgent(SessionId(sessionId));
+      return "agent" in resolved ? resolved.agent : undefined;
+    } catch (err) {
+      logger.warn(`workspace: 唤醒 ${sessionId} 失败: ${String(err)}`);
+      return undefined;
+    }
   }
 
   private async deliver(
@@ -457,6 +502,10 @@ export class WorkspaceSessions {
     if (!ours) this.busy.add(sessionId);
     await this.reply(sender, `已交给 ${label}。`);
     timing.ackAt = Date.now();
+    // Wake first (a no-op when live) so the WeChat question tool is on the
+    // agent before its turn builds the tool list.
+    const live = await this.wake(sessionId);
+    if (live !== undefined) this.ensureTools(live.ctx, sessionId);
     const sent = await sendToDshSession(this.ctx, sessionId, text, { kind: ROUTE_KIND, wake: true });
     timing.deliveredAt = Date.now();
     if (!sent.ok) {
@@ -567,6 +616,8 @@ export class WorkspaceSessions {
     if (list.length === 0) this.queue.delete(sessionId);
     this.busy.add(sessionId);
     await this.reply(item.sender, `轮到 ${item.label} 了。`);
+    const live = await this.wake(sessionId);
+    if (live !== undefined) this.ensureTools(live.ctx, sessionId);
     const sent = await sendToDshSession(this.ctx, sessionId, item.text, { kind: ROUTE_KIND, wake: true });
     if (!sent.ok) {
       this.busy.delete(sessionId);

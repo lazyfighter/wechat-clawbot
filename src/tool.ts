@@ -630,7 +630,7 @@ function registerSendTextTool(agentCtx: Context, deps: SendFileToolDeps): void {
  * the webapp — so on the WeChat agent this tool sends the question through
  * WeChat and waits for the reply (5 min timeout).
  */
-function registerWechatAskTool(agentCtx: Context, deps: SendFileToolDeps): void {
+export function registerWechatAskTool(agentCtx: Context, deps: SendFileToolDeps): void {
   agentCtx.tools.register(
     defineTool({
       name: "ask_user_question",
