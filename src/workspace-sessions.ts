@@ -276,16 +276,20 @@ export class WorkspaceSessions {
     }
   }
 
-  /** The 工作区 reply: what exists, and whether a session does too. */
+  /**
+   * The workspace list: one copyable `@助理-xxx` per line.
+   *
+   * WeChat has no tappable commands, so the only way to "use" this list is to
+   * long-press one line and paste it. Anything else on that line (title,
+   * markers) would be copied too.
+   */
   private describe(): string {
     const entries = this.workspaces();
     if (entries.length === 0) return "这个 DSH 没有可用的工作区服务，或者工作区是空的。";
-    const state = loadRoutes();
-    const lines = entries.map((entry) => {
-      const made = state.workspaces[entry.id] === undefined ? "" : "（已建会话）";
-      return `· ${entry.title}${made}`;
-    });
-    return `工作区 ${entries.length} 个：\n${lines.join("\n")}\n\n发「@助理-工作区名 内容」交给它。`;
+    const lines = [...entries]
+      .sort((a, b) => (a.title < b.title ? -1 : a.title > b.title ? 1 : 0))
+      .map((entry) => `@助理-${entry.title}`);
+    return `工作区 ${entries.length} 个，直接 @ 就行：\n\n${lines.join("\n")}\n\n用法：${lines[0] ?? "@助理-工作区名"} 帮我看看构建失败`;
   }
 
   private async ensureSession(workspace: WorkspaceLike): Promise<SessionRecord> {

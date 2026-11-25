@@ -231,8 +231,13 @@ test("the list command and an unknown workspace both answer without a session", 
   const router = new WorkspaceSessions(host.ctx, inbox.sendText);
 
   assert.equal(await router.tryHandle("owner", "工作区"), true);
-  assert.match(inbox.sent[0].text, /工作区 1 个/);
-  assert.match(inbox.sent[0].text, /wohome/);
+  assert.equal(inbox.sent[0].text, [
+    "工作区 1 个，直接 @ 就行：",
+    "",
+    "@助理-wohome",
+    "",
+    "用法：@助理-wohome 帮我看看构建失败",
+  ].join("\n"));
 
   assert.equal(await router.tryHandle("owner", "@助理-nope 在吗"), true);
   assert.match(inbox.sent[1].text, /没找到「nope」/);
