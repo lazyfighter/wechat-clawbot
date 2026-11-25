@@ -13,12 +13,15 @@ process.env.CLAWBOT_STATE_DIR = mkdtempSync(join(tmpdir(), "clawbot-ws-live-"));
 
 const { WorkspaceSessions, loadRoutes } = await import("../lib/workspace-sessions.js");
 
-const WORKSPACES = [{ id: "w1", title: "wohome", path: "/Users/x/wohome" }];
+const WOHOME = "/Users/x/wohome";
 
 /** A host just real enough: workspace list, sessionTitle, agent create/get. */
 function stubHost() {
   const agents = new Map();
   const catalog = new Map();
+  /** The workspace's session projection, as the host maintains it. */
+  const sessionIds = [];
+  const workspaces = [{ id: "w1", title: "wohome", path: WOHOME, sessionIds }];
   const created = [];
   const renamed = [];
   const turns = new Map();
@@ -26,6 +29,7 @@ function stubHost() {
   /** Pre-seed a session the host knows about but does not hold live. */
   function seed(id, cwd, title) {
     catalog.set(id, { cwd, title });
+    if (title === "微信助理" && !sessionIds.includes(id)) sessionIds.unshift(id);
   }
 
   function makeAgent(sessionId, cwd) {
@@ -64,7 +68,7 @@ function stubHost() {
 
   const ctx = {
     get(name) {
-      if (name === "workspaceRegistry") return { list: () => WORKSPACES };
+      if (name === "workspaceRegistry") return { list: () => workspaces };
       if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "p", model: "m" }) };
       if (name === "sessionQuery") {
         return {
@@ -73,10 +77,9 @@ function stubHost() {
             live: agents.has(id),
             persisted: true,
           })),
-          readTitleSnapshots: async (ids) => ids.map((id) => ({
-            status: "fulfilled",
-            value: { title: { title: catalog.get(id)?.title } },
-          })),
+          readTitleSnapshots: async (ids) => ids.map((id) => (catalog.has(id) || agents.has(id)
+            ? { status: "fulfilled", value: { title: { title: catalog.get(id)?.title } } }
+            : { status: "rejected", reason: "unknown session" })),
         };
       }
       if (name === "sessionController") {

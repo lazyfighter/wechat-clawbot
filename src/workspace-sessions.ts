@@ -20,7 +20,7 @@ import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
 
-import { eventText, listDshSessions, sendToDshSession } from "./dsh-sessions.js";
+import { eventText, sendToDshSession } from "./dsh-sessions.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import { logger } from "./ilink/util/logger.js";
 
@@ -46,10 +46,21 @@ type WorkspaceLike = {
   readonly id: string;
   readonly title: string;
   readonly path: string;
+  /** This workspace's header-validated sessions, most recent first. */
+  readonly sessionIds?: readonly string[];
 };
 
 type WorkspaceRegistryLike = {
   list(): readonly WorkspaceLike[];
+};
+
+/** The part of the host's `sessionQuery` service used to read titles. */
+type SessionQueryLike = {
+  listSessions(): Promise<readonly { header: { id: unknown } }[]>;
+  readTitleSnapshots(ids: readonly string[]): Promise<readonly {
+    status: string;
+    value?: { title?: { title?: string } };
+  }[]>;
 };
 
 /** The part of the host's `sessionTitle` service used to pin a name. */
@@ -87,6 +98,22 @@ function service<T>(ctx: Context, name: string): T | undefined {
     return get.call(ctx, name) as T | undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * One JSON line per routed message, in the plugin state dir. Plugin logs go to
+ * the app's stderr, which the desktop build does not persist, so the only way
+ * to see where a WeChat round trip spends its time is to write it down.
+ */
+export function recordTiming(line: Record<string, unknown>): void {
+  try {
+    const file = path.join(resolveStateDir(), "route-timing.jsonl");
+    const stats = fs.statSync(file, { throwIfNoEntry: false }) as { size?: number } | undefined;
+    if ((stats?.size ?? 0) > 512 * 1024) fs.writeFileSync(file, "");
+    fs.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...line })}\n`);
+  } catch {
+    // Diagnostics must never break routing.
   }
 }
 
@@ -164,6 +191,17 @@ export function matchWorkspace(
     ?? entries.find((entry) => path.basename(entry.path).toLowerCase() === target);
 }
 
+/** Where one routed message spent its time, in epoch ms. */
+type RouteTiming = {
+  inboundAt: number;
+  matchedAt: number;
+  sessionAt: number;
+  ackAt: number;
+  deliveredAt: number;
+  woke: boolean;
+  delivered: string;
+};
+
 export class WorkspaceSessions {
   /** Agents made here, held so their sessions stay live between turns. */
   private readonly handles = new Map<string, AgentHandle>();
@@ -187,6 +225,7 @@ export class WorkspaceSessions {
       await this.reply(sender, this.describe());
       return true;
     }
+    const inboundAt = Date.now();
     const entries = this.workspaces();
     const parsed = parseRoute(body, routeNames(entries));
     if (parsed === undefined) return false;
@@ -194,6 +233,7 @@ export class WorkspaceSessions {
       await this.reply(sender, this.describe());
       return true;
     }
+    const matchedAt = Date.now();
     const workspace = matchWorkspace(entries, parsed.name);
     if (workspace === undefined) {
       await this.reply(sender, `没找到「${parsed.name}」这个工作区。\n\n${this.describe()}`);
@@ -213,7 +253,15 @@ export class WorkspaceSessions {
       await this.reply(sender, `${label} 已就绪，直接说事。`);
       return true;
     }
-    await this.deliver(sender, label, record.sessionId, text);
+    await this.deliver(sender, label, record.sessionId, text, {
+      inboundAt,
+      matchedAt,
+      sessionAt: Date.now(),
+      ackAt: 0,
+      deliveredAt: 0,
+      woke: false,
+      delivered: "",
+    });
     return true;
   }
 
@@ -263,15 +311,30 @@ export class WorkspaceSessions {
     return record;
   }
 
-  /** The workspace's existing `微信助理` session, if it has one. */
+  /**
+   * The workspace's existing `微信助理` session, if it has one.
+   *
+   * Only the workspace's own session projection is read: listing every session
+   * on the machine (312 of them here) to find one title cost ~5s before the
+   * first WeChat message of a workspace could even be acknowledged.
+   */
   private async defaultSession(workspace: WorkspaceLike): Promise<string | undefined> {
-    const { rows } = await listDshSessions(this.ctx);
-    const wanted = path.normalize(workspace.path);
-    const hit = rows.find((row) =>
-      row.title === SESSION_TITLE
-      && row.cwd !== undefined
-      && path.normalize(row.cwd) === wanted);
-    return hit?.id;
+    const ids = (workspace.sessionIds ?? []).map(String);
+    if (ids.length === 0) return undefined;
+    const query = service<SessionQueryLike>(this.ctx, "sessionQuery");
+    if (query === undefined) return undefined;
+    try {
+      const snapshots = await query.readTitleSnapshots(ids);
+      for (let index = 0; index < ids.length; index += 1) {
+        if (snapshots[index]?.status === "fulfilled"
+          && snapshots[index]?.value?.title?.title === SESSION_TITLE) {
+          return ids[index];
+        }
+      }
+    } catch (err) {
+      logger.warn(`workspace: 读 ${workspace.title} 的会话标题失败: ${String(err)}`);
+    }
+    return undefined;
   }
 
   /**
@@ -281,11 +344,17 @@ export class WorkspaceSessions {
    */
   private async sessionExists(sessionId: string): Promise<boolean> {
     if (this.ctx.agents.get(SessionId(sessionId)) !== undefined) return true;
-    const query = service<{ listSessions(): Promise<readonly { header: { id: unknown } }[]> }>(
-      this.ctx,
-      "sessionQuery",
-    );
+    const query = service<SessionQueryLike>(this.ctx, "sessionQuery");
     if (query === undefined) return true;
+    // One id, not the whole machine: probing the corpus for a single session is
+    // cheap, listing every session is not (and this runs on the first message
+    // after each DSH restart).
+    try {
+      const [probe] = await query.readTitleSnapshots([sessionId]);
+      if (probe?.status === "fulfilled") return true;
+    } catch {
+      // fall through to the full list: a rejection cannot tell "gone" from an I/O error
+    }
     try {
       const rows = await query.listSessions();
       return rows.some((row) => String(row.header.id) === sessionId);
@@ -339,7 +408,13 @@ export class WorkspaceSessions {
     logger.info(`workspace: 新建 ${sessionId} → ${SESSION_TITLE} (${workspace.path})`);
   }
 
-  private async deliver(sender: string, label: string, sessionId: string, text: string): Promise<void> {
+  private async deliver(
+    sender: string,
+    label: string,
+    sessionId: string,
+    text: string,
+    timing: RouteTiming,
+  ): Promise<void> {
     const agent = this.ctx.agents.get(SessionId(sessionId));
     const ours = this.busy.has(sessionId);
     if (!ours && agent !== undefined && agent.status === "running") {
@@ -353,12 +428,16 @@ export class WorkspaceSessions {
     }
     if (!ours) this.busy.add(sessionId);
     await this.reply(sender, `已交给 ${label}。`);
+    timing.ackAt = Date.now();
     const sent = await sendToDshSession(this.ctx, sessionId, text, { kind: ROUTE_KIND, wake: true });
+    timing.deliveredAt = Date.now();
     if (!sent.ok) {
       if (!ours) this.busy.delete(sessionId);
       await this.reply(sender, `没送进 ${label}：${sent.message}`);
       return;
     }
+    timing.woke = sent.woke;
+    timing.delivered = sent.delivered;
     if (ours) return; // steered into the turn already being watched
     if (sent.delivered !== "followup") {
       // A turn nobody here started grabbed the message in the gap between the
@@ -367,11 +446,18 @@ export class WorkspaceSessions {
       await this.reply(sender, `${label} 正有一轮在跑，这条并进去了，结果到网页里看。`);
       return;
     }
-    void this.watch(sender, label, sessionId, sent.agent as unknown as Agent, sent.before);
+    void this.watch(sender, label, sessionId, sent.agent as unknown as Agent, sent.before, timing);
   }
 
   /** Wait for the turn to end, then send its last text to WeChat. */
-  private async watch(sender: string, label: string, sessionId: string, agent: Agent, before: number): Promise<void> {
+  private async watch(
+    sender: string,
+    label: string,
+    sessionId: string,
+    agent: Agent,
+    before: number,
+    timing?: RouteTiming,
+  ): Promise<void> {
     try {
       let timedOut = false;
       await Promise.race([
@@ -388,7 +474,23 @@ export class WorkspaceSessions {
         return;
       }
       const answer = this.lastText(agent, before);
+      const answeredAt = Date.now();
       await this.reply(sender, answer ?? `${label} 这一轮没有文字回复。`);
+      if (timing !== undefined) {
+        recordTiming({
+          sessionId,
+          woke: timing.woke,
+          delivered: timing.delivered,
+          chars: answer?.length ?? 0,
+          matchMs: timing.matchedAt - timing.inboundAt,
+          sessionMs: timing.sessionAt - timing.matchedAt,
+          ackMs: timing.ackAt - timing.sessionAt,
+          deliverMs: timing.deliveredAt - timing.ackAt,
+          turnMs: answeredAt - timing.deliveredAt,
+          replyMs: Date.now() - answeredAt,
+          totalMs: Date.now() - timing.inboundAt,
+        });
+      }
     } catch (err) {
       logger.error(`workspace: 等待 ${sessionId} 的回复失败: ${String(err)}`);
     } finally {
