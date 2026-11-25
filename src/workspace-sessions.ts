@@ -52,6 +52,8 @@ type WorkspaceLike = {
 
 type WorkspaceRegistryLike = {
   list(): readonly WorkspaceLike[];
+  /** The workspace that owns `path`, if any. */
+  resolveByPath(path: string): Promise<{ attachSession(sessionId: SessionId): Promise<void> } | undefined>;
 };
 
 /** The part of the host's `sessionQuery` service used to read titles. */
@@ -296,6 +298,7 @@ export class WorkspaceSessions {
     const state = loadRoutes();
     const existing = state.workspaces[workspace.id];
     if (existing !== undefined && existing.path === workspace.path && await this.sessionExists(existing.sessionId)) {
+      await this.attach(workspace, existing.sessionId);
       return existing;
     }
     if (existing !== undefined) {
@@ -310,6 +313,7 @@ export class WorkspaceSessions {
     } else {
       logger.info(`workspace: 接管 ${workspace.title} 已有的会话 ${adopted}`);
     }
+    await this.attach(workspace, sessionId);
     const record: SessionRecord = { sessionId, path: workspace.path, updatedAt: Date.now() };
     saveRoutes({ version: 1, workspaces: { ...state.workspaces, [workspace.id]: record } });
     return record;
@@ -339,6 +343,26 @@ export class WorkspaceSessions {
       logger.warn(`workspace: 读 ${workspace.title} 的会话标题失败: ${String(err)}`);
     }
     return undefined;
+  }
+
+  /**
+   * Make sure the workspace counts this session as a member.
+   *
+   * The GUI groups sessions per workspace by that membership, so a session
+   * created here (`agents.create`, not the GUI's new-session command) stays
+   * invisible in the workspace until it is attached.
+   */
+  private async attach(workspace: WorkspaceLike, sessionId: string): Promise<void> {
+    if ((workspace.sessionIds ?? []).some((id) => String(id) === sessionId)) return;
+    const registry = service<WorkspaceRegistryLike>(this.ctx, "workspaceRegistry");
+    if (registry === undefined) return;
+    try {
+      const entity = await registry.resolveByPath(workspace.path);
+      await entity?.attachSession(SessionId(sessionId));
+      logger.info(`workspace: 会话 ${sessionId} 挂到 ${workspace.title} 名下`);
+    } catch (err) {
+      logger.warn(`workspace: 把会话挂到 ${workspace.title} 失败: ${String(err)}`);
+    }
   }
 
   /**

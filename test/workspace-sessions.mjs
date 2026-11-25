@@ -21,6 +21,7 @@ function stubHost() {
   const catalog = new Map();
   /** The workspace's session projection, as the host maintains it. */
   const sessionIds = [];
+  const attached = [];
   const workspaces = [{ id: "w1", title: "wohome", path: WOHOME, sessionIds }];
   const created = [];
   const renamed = [];
@@ -68,7 +69,21 @@ function stubHost() {
 
   const ctx = {
     get(name) {
-      if (name === "workspaceRegistry") return { list: () => workspaces };
+      if (name === "workspaceRegistry") {
+        return {
+          list: () => workspaces,
+          resolveByPath: async (p) => {
+            const owner = workspaces.find((entry) => entry.path === p);
+            if (owner === undefined) return undefined;
+            return {
+              attachSession: async (id) => {
+                attached.push(id);
+                if (!owner.sessionIds.includes(id)) owner.sessionIds.unshift(id);
+              },
+            };
+          },
+        };
+      }
       if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "p", model: "m" }) };
       if (name === "sessionQuery") {
         return {
@@ -123,7 +138,7 @@ function stubHost() {
       },
     },
   };
-  return { ctx, created, renamed, agents, turns, seed };
+  return { ctx, created, renamed, agents, turns, seed, attached, workspaces };
 }
 
 function makeInbox() {
@@ -159,6 +174,10 @@ test("a routed message creates a session, pins the title, and answers", async ()
   assert.equal(host.renamed[0].title, "微信助理");
 
   const sessionId = host.created[0].sessionId;
+  // The GUI groups sessions per workspace by membership: an unattached session
+  // is invisible in the workspace it was made for.
+  assert.deepEqual(host.attached, [sessionId]);
+  assert.deepEqual(host.workspaces[0].sessionIds, [sessionId]);
   const record = loadRoutes().workspaces.w1;
   assert.equal(record.sessionId, sessionId);
   assert.equal(record.path, "/Users/x/wohome");
