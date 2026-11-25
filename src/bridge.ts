@@ -601,6 +601,15 @@ export class WechatBridge {
     this.noteSession(`[补发] 刚才把之前没送达的 ${items.length} 条消息（原定 ${span}）补发给了对方。`);
   }
 
+  /**
+   * Record in the bot's own conversation that a WeChat message was handed to a
+   * workspace session. Injected like a backlog note: durable and readable on
+   * the next turn, without waking the bot to answer it.
+   */
+  noteRoute(text: string): void {
+    this.noteSession(text);
+  }
+
   /** A line for the bot about what was (or was not) delivered late; it rides along with the next turn. */
   private noteSession(text: string): void {
     try {

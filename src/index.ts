@@ -426,7 +426,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
           getAccount: () => account,
           config,
         });
-      }),
+      }, (text) => bridge?.noteRoute(text)),
     });
 
     abort = new AbortController();

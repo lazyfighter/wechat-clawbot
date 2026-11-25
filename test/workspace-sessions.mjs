@@ -4,14 +4,14 @@
  * queue that keeps a GUI-started turn untouched.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 process.env.CLAWBOT_STATE_DIR = mkdtempSync(join(tmpdir(), "clawbot-ws-live-"));
 
-const { WorkspaceSessions, loadRoutes } = await import("../lib/workspace-sessions.js");
+const { WorkspaceSessions, loadRoutes, routeLogFile, readRoutes } = await import("../lib/workspace-sessions.js");
 
 const WOHOME = "/Users/x/wohome";
 
@@ -273,6 +273,7 @@ test("the list command and an unknown workspace both answer without a session", 
     "@助理-wohome",
     "",
     "用法：@助理-wohome 帮我看看构建失败",
+    "查路由记录：/路由",
   ].join("\n"));
 
   assert.equal(await router.tryHandle("owner", "@助理-nope 在吗"), true);
@@ -280,4 +281,44 @@ test("the list command and an unknown workspace both answer without a session", 
   assert.equal(host.created.length, 0);
 
   assert.equal(await router.tryHandle("owner", "随便聊聊"), false);
+});
+
+test("a routed message is recorded and can be listed with /路由", async () => {
+  writeFileSync(routeLogFile(), "");
+  const host = stubHost();
+  const inbox = makeInbox();
+  const notes = [];
+  const router = new WorkspaceSessions(host.ctx, inbox.sendText, undefined, (text) => notes.push(text));
+
+  await router.tryHandle("owner", "@助理-wohome 看看构建为什么挂了");
+  const sessionId = host.created[0].sessionId;
+  await answer(host.turns, sessionId, "编译报错在 Foo.java");
+
+  const routes = readRoutes();
+  assert.equal(routes.length, 1);
+  assert.equal(routes[0].label, "助理-wohome");
+  assert.equal(routes[0].sessionId, sessionId);
+  assert.equal(routes[0].delivered, "followup");
+  assert.equal(routes[0].text, "看看构建为什么挂了");
+
+  // The bot's own conversation gets one line about it, and is never woken for it.
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /路由记录/);
+  assert.match(notes[0], /已转给 助理-wohome/);
+  assert.match(notes[0], /看看构建为什么挂了/);
+
+  await router.tryHandle("owner", "/路由");
+  const listed = inbox.sent.at(-1).text;
+  assert.match(listed, /最近 1 条路由/);
+  assert.match(listed, /助理-wohome/);
+  assert.match(listed, /看看构建为什么挂了/);
+});
+
+test("/路由 without any record says so", async () => {
+  writeFileSync(routeLogFile(), "");
+  const host = stubHost();
+  const inbox = makeInbox();
+  const router = new WorkspaceSessions(host.ctx, inbox.sendText);
+  assert.equal(await router.tryHandle("owner", "路由"), true);
+  assert.match(inbox.sent[0].text, /还没有路由记录/);
 });

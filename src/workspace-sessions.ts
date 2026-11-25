@@ -20,7 +20,7 @@ import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
 
-import { eventText, sendToDshSession } from "./dsh-sessions.js";
+import { eventText, sendToDshSession, type DshSendResult } from "./dsh-sessions.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import { logger } from "./ilink/util/logger.js";
 
@@ -28,6 +28,8 @@ import { logger } from "./ilink/util/logger.js";
 export const ROUTE_PREFIX = "@助理-";
 /** A message that is exactly this answers with the workspace list. */
 export const LIST_COMMAND = "工作区";
+/** Ask what has been routed lately. */
+export const ROUTE_COMMAND = "路由";
 /** Title of the one default WeChat-assistant session a workspace holds. */
 export const SESSION_TITLE = "微信助理";
 /**
@@ -117,6 +119,52 @@ export function recordTiming(line: Record<string, unknown>): void {
   } catch {
     // Diagnostics must never break routing.
   }
+}
+
+/** Where the routing history lives: one line per WeChat message handed to a workspace. */
+export function routeLogFile(): string {
+  return path.join(resolveStateDir(), "routes.jsonl");
+}
+
+/** Append one routing record; bounded like the timing file. */
+export function recordRoute(entry: Record<string, unknown>): void {
+  try {
+    const file = routeLogFile();
+    const stats = fs.statSync(file, { throwIfNoEntry: false }) as { size?: number } | undefined;
+    if ((stats?.size ?? 0) > 512 * 1024) fs.writeFileSync(file, "");
+    fs.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
+  } catch {
+    // Diagnostics must never break routing.
+  }
+}
+
+/** The recorded routes, oldest first; a broken line is skipped, not fatal. */
+export function readRoutes(): Record<string, unknown>[] {
+  try {
+    return fs.readFileSync(routeLogFile(), "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .flatMap((line) => {
+        try {
+          return [JSON.parse(line) as Record<string, unknown>];
+        } catch {
+          return [];
+        }
+      });
+  } catch {
+    return [];
+  }
+}
+
+/** What the bot's own conversation is told about one routed message. */
+export function routeNote(label: string, text: string, sent: DshSendResult): string {
+  const clipped = text.length > 80 ? `${text.slice(0, 80)}…` : text;
+  const outcome = !sent.ok
+    ? `没送进 ${label}：${sent.message}`
+    : sent.delivered === "steered"
+      ? `续进了 ${label} 正在跑的那一轮`
+      : `已转给 ${label}`;
+  return `（路由记录，不用回应）微信收到「${clipped}」，${outcome}。`;
 }
 
 /** Where the workspace → session map lives (inside the plugin's state dir). */
@@ -223,6 +271,8 @@ export class WorkspaceSessions {
      * answer — the turn sits there until it times out.
      */
     private readonly registerTools?: (agentCtx: Context) => void,
+    /** Records a routed message in the bot's own conversation (never wakes it). */
+    private readonly notifyBot?: (text: string) => void,
   ) {}
 
   /**
@@ -233,6 +283,10 @@ export class WorkspaceSessions {
     const trimmed = body.trim();
     if (trimmed === LIST_COMMAND || trimmed === `/${LIST_COMMAND}`) {
       await this.reply(sender, this.describe());
+      return true;
+    }
+    if (trimmed === ROUTE_COMMAND || trimmed === `/${ROUTE_COMMAND}`) {
+      await this.reply(sender, this.recentRoutes());
       return true;
     }
     const inboundAt = Date.now();
@@ -286,6 +340,24 @@ export class WorkspaceSessions {
     }
   }
 
+  /** The /路由 reply: the last few messages handed to a workspace. */
+  private recentRoutes(): string {
+    const routes = readRoutes();
+    if (routes.length === 0) {
+      return "还没有路由记录。发「@助理-工作区名 内容」就有了。";
+    }
+    const recent = routes.slice(-10).reverse();
+    const lines = recent.map((entry) => {
+      const at = String(entry.at ?? "");
+      const time = at.length >= 16 ? at.slice(11, 16) : at;
+      const state = entry.delivered === "failed"
+        ? "没送进"
+        : entry.delivered === "steered" ? "并入" : "已投递";
+      return `${time} ${String(entry.label ?? "")} · ${state} · ${String(entry.chars ?? "")} 字\n  「${String(entry.text ?? "")}」`;
+    });
+    return `最近 ${recent.length} 条路由：\n\n${lines.join("\n")}`;
+  }
+
   /**
    * The workspace list: one copyable `@助理-xxx` per line.
    *
@@ -299,7 +371,7 @@ export class WorkspaceSessions {
     const lines = [...entries]
       .sort((a, b) => (a.title < b.title ? -1 : a.title > b.title ? 1 : 0))
       .map((entry) => `@助理-${entry.title}`);
-    return `工作区 ${entries.length} 个，直接 @ 就行：\n\n${lines.join("\n")}\n\n用法：${lines[0] ?? "@助理-工作区名"} 帮我看看构建失败`;
+    return `工作区 ${entries.length} 个，直接 @ 就行：\n\n${lines.join("\n")}\n\n用法：${lines[0] ?? "@助理-工作区名"} 帮我看看构建失败\n查路由记录：/路由`;
   }
 
   private async ensureSession(workspace: WorkspaceLike): Promise<SessionRecord> {
@@ -508,6 +580,17 @@ export class WorkspaceSessions {
     if (live !== undefined) this.ensureTools(live.ctx, sessionId);
     const sent = await sendToDshSession(this.ctx, sessionId, text, { kind: ROUTE_KIND, wake: true });
     timing.deliveredAt = Date.now();
+    // Tell the bot's own conversation what happened (injected, never woken),
+    // and keep a queryable record behind /路由.
+    this.notifyBot?.(routeNote(label, text, sent));
+    recordRoute({
+      sender,
+      label,
+      sessionId,
+      text: text.length > 200 ? `${text.slice(0, 200)}…` : text,
+      chars: text.length,
+      delivered: sent.ok ? sent.delivered : "failed",
+    });
     if (!sent.ok) {
       if (!ours) this.busy.delete(sessionId);
       await this.reply(sender, `没送进 ${label}：${sent.message}`);
